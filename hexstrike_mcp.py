@@ -20,7 +20,11 @@ Framework: FastMCP integration for tool orchestration
 import sys
 import os
 import argparse
+import ipaddress
 import logging
+import shlex
+import shutil
+import socket
 from typing import Dict, Any, Optional
 import requests
 import time
@@ -281,7 +285,13 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient) -> FastMCP:
     # ============================================================================
 
     @mcp.tool()
-    def nmap_scan(target: str, scan_type: str = "-sV", ports: str = "", additional_args: str = "") -> Dict[str, Any]:
+    def nmap_scan(
+        target: str,
+        scan_type: str = "-sV",
+        ports: str = "",
+        additional_args: str = "",
+        use_sudo: bool = False,
+    ) -> Dict[str, Any]:
         """
         Execute an enhanced Nmap scan against a target with real-time logging.
 
@@ -290,6 +300,7 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient) -> FastMCP:
             scan_type: Scan type (e.g., -sV for version detection, -sC for scripts)
             ports: Comma-separated list of ports or port ranges
             additional_args: Additional Nmap arguments
+            use_sudo: Run Nmap through sudo -n for features requiring local root privileges
 
         Returns:
             Scan results with enhanced telemetry
@@ -298,7 +309,8 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient) -> FastMCP:
             "target": target,
             "scan_type": scan_type,
             "ports": ports,
-            "additional_args": additional_args
+            "additional_args": additional_args,
+            "use_sudo": use_sudo,
         }
         logger.info(f"{HexStrikeColors.FIRE_RED}🔍 Initiating Nmap scan: {target}{HexStrikeColors.RESET}")
 
@@ -322,6 +334,143 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient) -> FastMCP:
                 logger.error(f"{HexStrikeColors.CRITICAL} HUMAN ESCALATION REQUIRED {HexStrikeColors.RESET}")
 
         return result
+
+    @mcp.tool()
+    def nmap(target: str, additional_args: str = "-sV", use_sudo: bool = False) -> Dict[str, Any]:
+        """
+        METATRON-compatible direct Nmap tool.
+
+        Args:
+            target: The IP address or hostname to scan
+            additional_args: Raw Nmap arguments METATRON requested
+            use_sudo: Run Nmap through sudo -n when needed
+
+        Returns:
+            Scan results with enhanced telemetry
+        """
+        data = {
+            "target": target,
+            "scan_type": "",
+            "ports": "",
+            "additional_args": additional_args,
+            "use_sudo": use_sudo,
+            "use_recovery": True,
+        }
+        logger.info(f"{HexStrikeColors.FIRE_RED}🔍 METATRON Nmap: {target} {additional_args}{HexStrikeColors.RESET}")
+        return hexstrike_client.safe_post("api/tools/nmap", data)
+
+    def _minimal_whois(target: str, timeout_seconds: int = 8) -> Dict[str, Any]:
+        try:
+            address = ipaddress.ip_address(str(target))
+            if address.is_private or address.is_loopback or address.is_link_local:
+                return {
+                    "success": True,
+                    "stdout": f"{target} is a non-public address; public whois lookup is not applicable.",
+                    "stderr": "",
+                    "return_code": 0,
+                }
+        except ValueError:
+            pass
+
+        try:
+            with socket.create_connection(("whois.iana.org", 43), timeout=timeout_seconds) as sock:
+                sock.sendall((str(target).strip() + "\r\n").encode("utf-8"))
+                chunks = []
+                while True:
+                    data = sock.recv(4096)
+                    if not data:
+                        break
+                    chunks.append(data)
+            stdout = b"".join(chunks).decode("utf-8", errors="replace")
+            return {"success": True, "stdout": stdout, "stderr": "", "return_code": 0}
+        except Exception as exc:
+            return {
+                "success": False,
+                "stdout": "",
+                "stderr": str(exc),
+                "error": f"whois fallback failed: {exc}",
+                "return_code": 1,
+            }
+
+    @mcp.tool()
+    def whois(target: str, additional_args: str = "") -> Dict[str, Any]:
+        """
+        METATRON-compatible direct Whois lookup.
+
+        Args:
+            target: Domain, IP address, or netblock to query
+            additional_args: Additional whois arguments
+
+        Returns:
+            Whois command results with enhanced telemetry
+        """
+        logger.info(f"🔎 METATRON Whois: {target}")
+        if not shutil.which("whois"):
+            return _minimal_whois(target)
+        command = " ".join(part for part in [
+            "whois",
+            additional_args.strip(),
+            shlex.quote(str(target)),
+        ] if part)
+        return hexstrike_client.execute_command(command, use_cache=False)
+
+    @mcp.tool()
+    def whatweb(target: str, additional_args: str = "-a 3") -> Dict[str, Any]:
+        """
+        METATRON-compatible direct WhatWeb fingerprinting.
+
+        Args:
+            target: URL, IP address, or hostname to fingerprint
+            additional_args: Additional WhatWeb arguments
+
+        Returns:
+            WhatWeb results with enhanced telemetry
+        """
+        logger.info(f"🧬 METATRON WhatWeb: {target}")
+        return hexstrike_client.safe_post(
+            "api/tools/whatweb",
+            {"target": target, "additional_args": additional_args},
+        )
+
+    @mcp.tool()
+    def curl(target: str, additional_args: str = "-sI --max-time 10 --location") -> Dict[str, Any]:
+        """
+        METATRON-compatible direct curl request.
+
+        Args:
+            target: URL to request
+            additional_args: Additional curl arguments
+
+        Returns:
+            Curl command results with enhanced telemetry
+        """
+        command = " ".join(part for part in [
+            "curl",
+            additional_args.strip(),
+            shlex.quote(str(target)),
+        ] if part)
+        logger.info(f"🌐 METATRON curl: {target}")
+        return hexstrike_client.execute_command(command, use_cache=False)
+
+    @mcp.tool()
+    def dig(target: str, additional_args: str = "+short A") -> Dict[str, Any]:
+        """
+        METATRON-compatible direct dig query.
+
+        Args:
+            target: Domain or IP address to query
+            additional_args: Additional dig arguments
+
+        Returns:
+            Dig command results with enhanced telemetry
+        """
+        command = " ".join(part for part in [
+            "dig",
+            additional_args.strip(),
+            shlex.quote(str(target)),
+        ] if part)
+        logger.info(f"🧭 METATRON dig: {target}")
+        return hexstrike_client.execute_command(command, use_cache=False)
 
     @mcp.tool()
     def gobuster_scan(url: str, mode: str = "dir", wordlist: str = "/usr/share/wordlists/dirb/common.txt", additional_args: str = "") -> Dict[str, Any]:
@@ -1071,6 +1220,32 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient) -> FastMCP:
             logger.info(f"✅ SQLMap scan completed for {url}")
         else:
             logger.error(f"❌ SQLMap scan failed for {url}")
+        return result
+
+    @mcp.tool()
+    def searchsploit_search(query: str, additional_args: str = "", json_output: bool = False) -> Dict[str, Any]:
+        """
+        Search Exploit-DB for observed product/version evidence without running exploits.
+
+        Args:
+            query: Product/version or CVE query to search for
+            additional_args: Additional searchsploit arguments
+            json_output: Request JSON output from searchsploit
+
+        Returns:
+            Searchsploit lookup results
+        """
+        data = {
+            "query": query,
+            "additional_args": additional_args,
+            "json": json_output
+        }
+        logger.info(f"🔎 Starting Searchsploit lookup: {query}")
+        result = hexstrike_client.safe_post("api/tools/searchsploit", data)
+        if result.get("success"):
+            logger.info(f"✅ Searchsploit lookup completed: {query}")
+        else:
+            logger.error(f"❌ Searchsploit lookup failed: {query}")
         return result
 
     @mcp.tool()

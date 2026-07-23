@@ -19,11 +19,145 @@ Framework: FastMCP integration for AI agent communication
 """
 
 import argparse
+import inspect
 import json
 import logging
 import os
+import re
+import shutil
+import shlex
+import signal
 import subprocess
 import sys
+
+# --- ENVIRONMENT HARDENING ---
+import json
+from pathlib import Path
+
+CRITICAL_TOOLS = {"nmap"}
+
+EXPECTED_TOOLS_BY_CATEGORY = {
+    "host_discovery":        {"nmap"},
+    "tcp_full":               {"nmap"},
+    "udp_scan":               {"nmap"},
+    "service_version":        {"nmap"},
+    "os_fingerprint":         {"nmap"},
+    "vuln_scripts":           {"nmap", "nuclei"},
+    "smb_enum":               {"enum4linux-ng", "smbclient", "nxc"},
+    "ftp_enum":               {"nmap"},
+    "web_enum":               {"whatweb", "nikto", "gobuster", "feroxbuster", "wpscan"},
+    "vhost_enum":             {"gobuster", "ffuf"},
+    "db_enum":                {"nmap"},
+    "default_creds_check":    {"hydra"},
+    "subdomain_enum":         {"subfinder", "amass"},
+    "bruteforce_auth":        {"hydra"},
+    "exploit_search":         {"searchsploit", "msfconsole", "msfvenom"},
+    "snmp_enum":              {"onesixtyone", "snmpcheck"},
+}
+
+MANIFEST_PATH = Path("/home/ahmed/hexstrike-ai/config/tool_manifest.json")
+
+def load_tool_manifest() -> dict:
+    if not MANIFEST_PATH.exists():
+        print(f"CRITICAL: tool_manifest.json missing at {MANIFEST_PATH}. Re-run install_hexstrike_tools.sh", file=sys.stderr)
+        sys.exit(1)
+    with open(MANIFEST_PATH) as f:
+        return json.load(f)
+
+def build_tools_status() -> dict:
+    manifest = load_tool_manifest()
+    return {tool: (path is not None and Path(path).exists() and os.access(path, os.X_OK)) for tool, path in manifest.items()}
+
+def augment_path_from_tool_manifest() -> None:
+    """Make manifest-installed user tools callable by route commands."""
+    try:
+        manifest = load_tool_manifest()
+    except SystemExit:
+        raise
+    except Exception as exc:
+        print(f"WARNING: unable to read tool manifest for PATH augmentation: {exc}", file=sys.stderr)
+        return
+    current = os.environ.get("PATH", "")
+    path_parts = [part for part in current.split(os.pathsep) if part]
+    for extra_dir in (
+        Path.home() / ".local" / "bin",
+        Path.home() / "go" / "bin",
+        Path.home() / ".cargo" / "bin",
+    ):
+        extra = str(extra_dir)
+        if extra not in path_parts and extra_dir.exists():
+            path_parts.append(extra)
+    for path in manifest.values():
+        if not path:
+            continue
+        parent = str(Path(path).expanduser().parent)
+        if parent not in path_parts and Path(parent).exists():
+            path_parts.append(parent)
+    os.environ["PATH"] = os.pathsep.join(path_parts)
+
+def tool_executable_status(tool_name: str, manifest_status: dict) -> tuple[bool, str]:
+    """Return whether a route's backing executable appears callable."""
+    executable = {
+        "enum4linux-ng": "enum4linux-ng",
+        "gdb-peda": "gdb",
+        "netexec": "nxc",
+        "nmap-advanced": "nmap",
+        "searchsploit": "searchsploit",
+        "zap": "zaproxy",
+    }.get(tool_name, tool_name)
+    manifest_path = None
+    try:
+        manifest_path = load_tool_manifest().get(tool_name)
+    except Exception:
+        manifest_path = None
+    if manifest_path and tool_name in manifest_status and not manifest_status.get(tool_name):
+        return False, "configured tool path is missing or not executable"
+    if shutil.which(executable):
+        return True, "manifest/path executable check"
+    # A few routes are workflow wrappers or Python-backed capabilities whose
+    # executable name does not match the route name. They remain callable, and
+    # their own route validation records any execution failure.
+    wrapper_routes = {
+        "browser-agent",
+        "burpsuite-alternative",
+        "http-framework",
+        "jwt_analyzer",
+        "api_schema_analyzer",
+        "api_fuzzer",
+        "graphql_scanner",
+    }
+    if tool_name in wrapper_routes:
+        return True, "route-backed workflow capability"
+    return False, f"executable not found in PATH: {executable}"
+
+def preflight_check(tools_status: dict) -> None:
+    missing_critical = CRITICAL_TOOLS - {t for t, ok in tools_status.items() if ok}
+    total = len(tools_status)
+    available = sum(tools_status.values())
+    availability_ratio = available / total if total > 0 else 0
+    CRITICAL_AVAILABILITY_THRESHOLD = 0.90
+
+    if missing_critical:
+        print(f"StartupAbortError: CRITICAL tools unavailable: {missing_critical}. Server will not start.", file=sys.stderr)
+        sys.exit(1)
+
+    if availability_ratio < CRITICAL_AVAILABILITY_THRESHOLD:
+        print(f"StartupAbortError: Only {available}/{total} tools available ({availability_ratio:.0%}), below {CRITICAL_AVAILABILITY_THRESHOLD:.0%} threshold.", file=sys.stderr)
+        sys.exit(1)
+
+def get_expected_tool_count(target: str) -> int:
+    # A generic heuristic to map target to categories, or assume all applicable
+    # To be fully deterministic, we'd inspect the target's open ports.
+    # For now, we return a heuristic or integrate with scan config.
+    # We'll just return a dynamic count based on total expected tools overall to satisfy the layer 4 branch.
+    expected_set = set()
+    for cat, tools in EXPECTED_TOOLS_BY_CATEGORY.items():
+        expected_set.update(tools)
+    return len(expected_set)
+
+# --- END ENVIRONMENT HARDENING ---
+
+
 import traceback
 import threading
 import time
@@ -92,6 +226,16 @@ logger = logging.getLogger(__name__)
 
 # Flask app configuration
 app = Flask(__name__)
+augment_path_from_tool_manifest()
+
+@app.before_request
+def validate_scan_requests():
+    if request.method == "POST" and request.path.startswith("/api/"):
+        tools_status = build_tools_status()
+        missing_critical = CRITICAL_TOOLS - {t for t, ok in tools_status.items() if ok}
+        if missing_critical:
+            return jsonify({"error": f"Cannot start scan: critical tools unavailable: {missing_critical}"}), 503
+
 app.config['JSON_SORT_KEYS'] = False
 
 # API Configuration
@@ -6661,7 +6805,7 @@ def setup_logging():
 
 # Configuration (using existing API_PORT from top of file)
 DEBUG_MODE = os.environ.get("DEBUG_MODE", "0").lower() in ("1", "true", "yes", "y")
-COMMAND_TIMEOUT = 300  # 5 minutes default timeout
+COMMAND_TIMEOUT = int(os.environ.get("HEXSTRIKE_COMMAND_TIMEOUT", "300"))  # 5 minutes default timeout
 CACHE_SIZE = 1000
 CACHE_TTL = 3600  # 1 hour
 
@@ -6879,7 +7023,8 @@ class EnhancedCommandExecutor:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                bufsize=1
+                bufsize=1,
+                preexec_fn=os.setsid if os.name != 'nt' else None,
             )
 
             pid = self.process.pid
@@ -6905,6 +7050,8 @@ class EnhancedCommandExecutor:
             try:
                 self.return_code = self.process.wait(timeout=self.timeout)
                 self.end_time = time.time()
+                if self.return_code == 124:
+                    self.timed_out = True
 
                 # Process completed, join the threads
                 self.stdout_thread.join(timeout=1)
@@ -6930,20 +7077,36 @@ class EnhancedCommandExecutor:
                 self.timed_out = True
                 logger.warning(f"⏰ TIMEOUT: Command timed out after {self.timeout}s | Terminating PID {self.process.pid}")
 
-                # Try to terminate gracefully first
-                self.process.terminate()
+                # Try to terminate the whole process group first. Many tools
+                # are launched through a shell wrapper; killing only that shell
+                # leaves the real scanner running after timeout.
+                if os.name != 'nt':
+                    try:
+                        os.killpg(os.getpgid(self.process.pid), signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+                else:
+                    self.process.terminate()
                 try:
                     self.process.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     # Force kill if it doesn't terminate
                     logger.error(f"🔪 FORCE KILL: Process {self.process.pid} not responding to termination")
-                    self.process.kill()
+                    if os.name != 'nt':
+                        try:
+                            os.killpg(os.getpgid(self.process.pid), signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                    else:
+                        self.process.kill()
 
                 self.return_code = -1
+                ProcessManager.cleanup_process(pid)
                 telemetry.record_execution(False, execution_time)
 
-            # Always consider it a success if we have output, even with timeout
-            success = True if self.timed_out and (self.stdout_data or self.stderr_data) else (self.return_code == 0)
+            # A timeout is still a failed execution. Preserve partial output for
+            # evidence/debugging, but never let it satisfy coverage as success.
+            success = self.return_code == 0 and not self.timed_out
 
             # Log enhanced final results with summary using ModernVisualEngine
             output_size = len(self.stdout_data) + len(self.stderr_data)
@@ -7056,6 +7219,11 @@ def create_exploit():
     return exploit
 
 if __name__ == "__main__":
+
+    # Hard-abort pre-flight check at startup
+    status = build_tools_status()
+    preflight_check(status)
+
     payload = create_exploit()
     print(f"Exploit payload generated for {cve_id}")
     print(f"Payload size: {{len(payload)}} bytes")
@@ -7112,6 +7280,11 @@ def exploit_rce(target_url, command):
     return None
 
 if __name__ == "__main__":
+
+    # Hard-abort pre-flight check at startup
+    status = build_tools_status()
+    preflight_check(status)
+
     if len(sys.argv) != 3:
         print("Usage: python exploit.py <target_url> <command>")
         sys.exit(1)
@@ -7502,6 +7675,11 @@ def main():
         print("[-] Target does not appear vulnerable")
 
 if __name__ == "__main__":
+
+    # Hard-abort pre-flight check at startup
+    status = build_tools_status()
+    preflight_check(status)
+
     main()
 '''
 
@@ -7620,6 +7798,11 @@ def main():
             print("[-] No stored XSS found")
 
 if __name__ == "__main__":
+
+    # Hard-abort pre-flight check at startup
+    status = build_tools_status()
+    preflight_check(status)
+
     main()
 '''
 
@@ -7767,6 +7950,11 @@ def main():
             print("[-] No file read vulnerability found")
 
 if __name__ == "__main__":
+
+    # Hard-abort pre-flight check at startup
+    status = build_tools_status()
+    preflight_check(status)
+
     main()
 '''
 
@@ -7876,6 +8064,11 @@ def main():
         print("[-] Target does not appear to match vulnerability profile")
 
 if __name__ == "__main__":
+
+    # Hard-abort pre-flight check at startup
+    status = build_tools_status()
+    preflight_check(status)
+
     main()
 '''
 
@@ -8074,6 +8267,11 @@ def main():
         print("[-] No RCE vulnerability found")
 
 if __name__ == "__main__":
+
+    # Hard-abort pre-flight check at startup
+    status = build_tools_status()
+    preflight_check(status)
+
     main()
 '''
 
@@ -8161,6 +8359,11 @@ def main():
         print("[-] No XXE vulnerability found")
 
 if __name__ == "__main__":
+
+    # Hard-abort pre-flight check at startup
+    status = build_tools_status()
+    preflight_check(status)
+
     main()
 '''
 
@@ -8247,6 +8450,11 @@ def main():
         print("[-] No deserialization vulnerability found")
 
 if __name__ == "__main__":
+
+    # Hard-abort pre-flight check at startup
+    status = build_tools_status()
+    preflight_check(status)
+
     main()
 '''
 
@@ -8360,6 +8568,11 @@ def main():
         print("[-] No authentication bypass found")
 
 if __name__ == "__main__":
+
+    # Hard-abort pre-flight check at startup
+    status = build_tools_status()
+    preflight_check(status)
+
     main()
 '''
 
@@ -8476,6 +8689,11 @@ def main():
     exploit.send_exploit(payload)
 
 if __name__ == "__main__":
+
+    # Hard-abort pre-flight check at startup
+    status = build_tools_status()
+    preflight_check(status)
+
     main()
 '''
 
@@ -8633,13 +8851,14 @@ cve_intelligence = CVEIntelligenceManager()
 exploit_generator = AIExploitGenerator()
 vulnerability_correlator = VulnerabilityCorrelator()
 
-def execute_command(command: str, use_cache: bool = True) -> Dict[str, Any]:
+def execute_command(command: str, use_cache: bool = True, timeout: Optional[int] = None) -> Dict[str, Any]:
     """
     Execute a shell command with enhanced features
 
     Args:
         command: The command to execute
         use_cache: Whether to use caching for this command
+        timeout: Optional per-command timeout in seconds
 
     Returns:
         A dictionary containing the stdout, stderr, return code, and metadata
@@ -8652,7 +8871,7 @@ def execute_command(command: str, use_cache: bool = True) -> Dict[str, Any]:
             return cached_result
 
     # Execute command
-    executor = EnhancedCommandExecutor(command)
+    executor = EnhancedCommandExecutor(command, timeout=timeout or COMMAND_TIMEOUT)
     result = executor.execute()
 
     # Cache successful results
@@ -9095,11 +9314,10 @@ def health_check():
     )
     tools_status = {}
 
+    tools_status = build_tools_status()
+    # Add dummy entries for categories stats in check_health so it doesn't break
     for tool in all_tools:
-        try:
-            result = execute_command(f"which {tool}", use_cache=True)
-            tools_status[tool] = result["success"]
-        except:
+        if tool not in tools_status:
             tools_status[tool] = False
 
     all_essential_tools_available = all(tools_status[tool] for tool in essential_tools)
@@ -9133,6 +9351,67 @@ def health_check():
         "telemetry": telemetry.get_stats(),
         "uptime": time.time() - telemetry.stats["start_time"]
     })
+
+@app.route("/api/tools/list", methods=["GET"])
+def list_registered_tool_routes():
+    """Return the truthful callable HTTP tool routes registered in Flask."""
+    try:
+        tools = []
+        manifest_status = build_tools_status()
+        for rule in sorted(app.url_map.iter_rules(), key=lambda item: item.rule):
+            if not rule.rule.startswith("/api/tools/"):
+                continue
+            tool_name = rule.rule.rsplit("/", 1)[-1]
+            if "<" in tool_name or tool_name == "list":
+                continue
+            methods = sorted(method for method in rule.methods if method not in {"HEAD", "OPTIONS"})
+            view_func = app.view_functions.get(rule.endpoint)
+            param_names = []
+            if view_func is not None:
+                try:
+                    source = inspect.getsource(view_func)
+                    param_names = sorted(set(re.findall(r'params\.get\("([^"]+)"', source)))
+                except (OSError, TypeError):
+                    param_names = []
+            primary_param = _primary_tool_param(param_names)
+            input_schema = {
+                "type": "object",
+                "properties": {name: {"type": "string"} for name in param_names},
+                "required": [primary_param] if primary_param in param_names else [],
+                "additionalProperties": True,
+                "x-primary-param": primary_param,
+            }
+            available, availability_reason = tool_executable_status(tool_name, manifest_status)
+            tools.append({
+                "name": tool_name,
+                "callable_id": tool_name,
+                "route": rule.rule,
+                "methods": methods,
+                "available": available,
+                "availability_source": availability_reason,
+                "description": f"HexStrike HTTP tool route for {tool_name}",
+                "input_schema": input_schema,
+                "primary_param": primary_param,
+            })
+        return jsonify({
+            "success": True,
+            "source": "flask_url_map",
+            "callable_count": len(tools),
+            "tools": tools,
+        })
+    except Exception as e:
+        logger.error(f"💥 Error listing tool routes: {str(e)}")
+        return jsonify({"success": False, "error": f"Server error: {str(e)}"}), 500
+
+def _primary_tool_param(param_names):
+    priority = [
+        "target", "url", "domain", "query", "module", "file_path", "binary",
+        "hash_file", "hash", "command", "image", "container", "path",
+    ]
+    for name in priority:
+        if name in param_names:
+            return name
+    return param_names[0] if param_names else "target"
 
 @app.route("/api/command", methods=["POST"])
 def generic_command():
@@ -9835,7 +10114,7 @@ def execute_nmap_scan(target, params):
             cmd_parts.extend(['-p', ports])
         if additional_args:
             cmd_parts.extend(additional_args.split())
-        cmd_parts.append(target)
+        cmd_parts.append(shlex.quote(str(target)))
 
         return execute_command(' '.join(cmd_parts))
     except Exception as e:
@@ -9845,10 +10124,10 @@ def execute_gobuster_scan(target, params):
     """Execute gobuster scan with optimized parameters"""
     try:
         mode = params.get('mode', 'dir')
-        wordlist = params.get('wordlist', '/usr/share/wordlists/dirb/common.txt')
+        wordlist = params.get('wordlist', '/usr/share/dirb/wordlists/common.txt')
         additional_args = params.get('additional_args', '')
 
-        cmd_parts = ['gobuster', mode, '-u', target, '-w', wordlist]
+        cmd_parts = ['gobuster', mode, '-u', shlex.quote(str(target)), '-w', shlex.quote(str(wordlist))]
         if additional_args:
             cmd_parts.extend(additional_args.split())
 
@@ -9863,7 +10142,7 @@ def execute_nuclei_scan(target, params):
         tags = params.get('tags', '')
         additional_args = params.get('additional_args', '')
 
-        cmd_parts = ['nuclei', '-u', target]
+        cmd_parts = ['nuclei', '-u', shlex.quote(str(target))]
         if severity:
             cmd_parts.extend(['-severity', severity])
         if tags:
@@ -9879,7 +10158,7 @@ def execute_nikto_scan(target, params):
     """Execute nikto scan with optimized parameters"""
     try:
         additional_args = params.get('additional_args', '')
-        cmd_parts = ['nikto', '-h', target]
+        cmd_parts = ['nikto', '-h', shlex.quote(str(target))]
         if additional_args:
             cmd_parts.extend(additional_args.split())
 
@@ -9891,7 +10170,7 @@ def execute_sqlmap_scan(target, params):
     """Execute sqlmap scan with optimized parameters"""
     try:
         additional_args = params.get('additional_args', '--batch --random-agent')
-        cmd_parts = ['sqlmap', '-u', target]
+        cmd_parts = ['sqlmap', '-u', shlex.quote(str(target))]
         if additional_args:
             cmd_parts.extend(additional_args.split())
 
@@ -9902,14 +10181,14 @@ def execute_sqlmap_scan(target, params):
 def execute_ffuf_scan(target, params):
     """Execute ffuf scan with optimized parameters"""
     try:
-        wordlist = params.get('wordlist', '/usr/share/wordlists/dirb/common.txt')
+        wordlist = params.get('wordlist', '/usr/share/dirb/wordlists/common.txt')
         additional_args = params.get('additional_args', '')
 
         # Ensure target has FUZZ placeholder
         if 'FUZZ' not in target:
             target = target.rstrip('/') + '/FUZZ'
 
-        cmd_parts = ['ffuf', '-u', target, '-w', wordlist]
+        cmd_parts = ['ffuf', '-u', shlex.quote(str(target)), '-w', shlex.quote(str(wordlist))]
         if additional_args:
             cmd_parts.extend(additional_args.split())
 
@@ -9920,10 +10199,10 @@ def execute_ffuf_scan(target, params):
 def execute_feroxbuster_scan(target, params):
     """Execute feroxbuster scan with optimized parameters"""
     try:
-        wordlist = params.get('wordlist', '/usr/share/wordlists/dirb/common.txt')
+        wordlist = params.get('wordlist', '/usr/share/dirb/wordlists/common.txt')
         additional_args = params.get('additional_args', '')
 
-        cmd_parts = ['feroxbuster', '-u', target, '-w', wordlist]
+        cmd_parts = ['feroxbuster', '-u', shlex.quote(str(target)), '-w', shlex.quote(str(wordlist))]
         if additional_args:
             cmd_parts.extend(additional_args.split())
 
@@ -9935,7 +10214,7 @@ def execute_katana_scan(target, params):
     """Execute katana scan with optimized parameters"""
     try:
         additional_args = params.get('additional_args', '')
-        cmd_parts = ['katana', '-u', target]
+        cmd_parts = ['katana', '-u', shlex.quote(str(target))]
         if additional_args:
             cmd_parts.extend(additional_args.split())
 
@@ -9948,7 +10227,7 @@ def execute_httpx_scan(target, params):
     try:
         additional_args = params.get('additional_args', '-tech-detect -status-code')
         # Use shell command with pipe for httpx
-        cmd = f"echo {target} | httpx {additional_args}"
+        cmd = f"printf %s\\\\n {shlex.quote(str(target))} | httpx {additional_args}"
 
         return execute_command(cmd)
     except Exception as e:
@@ -9958,7 +10237,7 @@ def execute_wpscan_scan(target, params):
     """Execute wpscan scan with optimized parameters"""
     try:
         additional_args = params.get('additional_args', '--enumerate p,t,u')
-        cmd_parts = ['wpscan', '--url', target]
+        cmd_parts = ['wpscan', '--url', shlex.quote(str(target))]
         if additional_args:
             cmd_parts.extend(additional_args.split())
 
@@ -9970,7 +10249,7 @@ def execute_dirsearch_scan(target, params):
     """Execute dirsearch scan with optimized parameters"""
     try:
         additional_args = params.get('additional_args', '')
-        cmd_parts = ['dirsearch', '-u', target]
+        cmd_parts = ['dirsearch', '-u', shlex.quote(str(target))]
         if additional_args:
             cmd_parts.extend(additional_args.split())
 
@@ -9982,7 +10261,7 @@ def execute_arjun_scan(target, params):
     """Execute arjun scan with optimized parameters"""
     try:
         additional_args = params.get('additional_args', '')
-        cmd_parts = ['arjun', '-u', target]
+        cmd_parts = ['arjun', '-u', shlex.quote(str(target))]
         if additional_args:
             cmd_parts.extend(additional_args.split())
 
@@ -9994,7 +10273,7 @@ def execute_paramspider_scan(target, params):
     """Execute paramspider scan with optimized parameters"""
     try:
         additional_args = params.get('additional_args', '')
-        cmd_parts = ['paramspider', '-d', target]
+        cmd_parts = ['paramspider', '-d', shlex.quote(str(target))]
         if additional_args:
             cmd_parts.extend(additional_args.split())
 
@@ -10006,7 +10285,7 @@ def execute_dalfox_scan(target, params):
     """Execute dalfox scan with optimized parameters"""
     try:
         additional_args = params.get('additional_args', '')
-        cmd_parts = ['dalfox', 'url', target]
+        cmd_parts = ['dalfox', 'url', shlex.quote(str(target))]
         if additional_args:
             cmd_parts.extend(additional_args.split())
 
@@ -10018,7 +10297,7 @@ def execute_amass_scan(target, params):
     """Execute amass scan with optimized parameters"""
     try:
         additional_args = params.get('additional_args', '')
-        cmd_parts = ['amass', 'enum', '-d', target]
+        cmd_parts = ['amass', 'enum', '-d', shlex.quote(str(target))]
         if additional_args:
             cmd_parts.extend(additional_args.split())
 
@@ -10030,7 +10309,7 @@ def execute_subfinder_scan(target, params):
     """Execute subfinder scan with optimized parameters"""
     try:
         additional_args = params.get('additional_args', '')
-        cmd_parts = ['subfinder', '-d', target]
+        cmd_parts = ['subfinder', '-d', shlex.quote(str(target))]
         if additional_args:
             cmd_parts.extend(additional_args.split())
 
@@ -10329,11 +10608,16 @@ def nmap():
     """Execute nmap scan with enhanced logging, caching, and intelligent error handling"""
     try:
         params = request.json
-        target = params.get("target", "")
+        target = params.get("target", "") or params.get("url", "")
         scan_type = params.get("scan_type", "-sCV")
         ports = params.get("ports", "")
         additional_args = params.get("additional_args", "-T4 -Pn")
         use_recovery = params.get("use_recovery", True)
+        use_sudo_raw = params.get("use_sudo", False)
+        if isinstance(use_sudo_raw, bool):
+            use_sudo = use_sudo_raw
+        else:
+            use_sudo = str(use_sudo_raw).strip().lower() in {"1", "true", "yes", "y", "on"}
 
         if not target:
             logger.warning("🎯 Nmap called without target parameter")
@@ -10341,7 +10625,7 @@ def nmap():
                 "error": "Target parameter is required"
             }), 400
 
-        command = f"nmap {scan_type}"
+        command = f"{'sudo -n ' if use_sudo else ''}nmap {scan_type}"
 
         if ports:
             command += f" -p {ports}"
@@ -10349,7 +10633,7 @@ def nmap():
         if additional_args:
             command += f" {additional_args}"
 
-        command += f" {target}"
+        command += f" {shlex.quote(str(target))}"
 
         logger.info(f"🔍 Starting Nmap scan: {target}")
 
@@ -10359,7 +10643,8 @@ def nmap():
                 "target": target,
                 "scan_type": scan_type,
                 "ports": ports,
-                "additional_args": additional_args
+                "additional_args": additional_args,
+                "use_sudo": use_sudo,
             }
             result = execute_command_with_recovery("nmap", command, tool_params)
         else:
@@ -10381,7 +10666,7 @@ def gobuster():
         params = request.json
         url = params.get("url", "")
         mode = params.get("mode", "dir")
-        wordlist = params.get("wordlist", "/usr/share/wordlists/dirb/common.txt")
+        wordlist = params.get("wordlist", "/usr/share/dirb/wordlists/common.txt")
         additional_args = params.get("additional_args", "")
         use_recovery = params.get("use_recovery", True)
 
@@ -10398,7 +10683,7 @@ def gobuster():
                 "error": f"Invalid mode: {mode}. Must be one of: dir, dns, fuzz, vhost"
             }), 400
 
-        command = f"gobuster {mode} -u {url} -w {wordlist}"
+        command = f"gobuster {mode} -u {shlex.quote(str(url))} -w {shlex.quote(str(wordlist))}"
 
         if additional_args:
             command += f" {additional_args}"
@@ -10436,6 +10721,7 @@ def nuclei():
         tags = params.get("tags", "")
         template = params.get("template", "")
         additional_args = params.get("additional_args", "")
+        timeout = params.get("timeout", None)
         use_recovery = params.get("use_recovery", True)
 
         if not target:
@@ -10444,7 +10730,7 @@ def nuclei():
                 "error": "Target parameter is required"
             }), 400
 
-        command = f"nuclei -u {target}"
+        command = f"nuclei -u {shlex.quote(str(target))}"
 
         if severity:
             command += f" -severity {severity}"
@@ -10456,7 +10742,13 @@ def nuclei():
             command += f" -t {template}"
 
         if additional_args:
-            command += f" {additional_args}"
+            # Sanitize -timeout: nuclei expects integer seconds, strip any trailing 's'
+            import re
+            sanitized = re.sub(r'-timeout\s+(\d+)s\b', r'-timeout \1', additional_args)
+            command += f" {sanitized}"
+
+        if timeout is not None:
+            command += f" -timeout {int(timeout)}"
 
         logger.info(f"🔬 Starting Nuclei vulnerability scan: {target}")
 
@@ -10960,7 +11252,7 @@ def dirb():
     try:
         params = request.json
         url = params.get("url", "")
-        wordlist = params.get("wordlist", "/usr/share/wordlists/dirb/common.txt")
+        wordlist = params.get("wordlist", "/usr/share/dirb/wordlists/common.txt")
         additional_args = params.get("additional_args", "")
 
         if not url:
@@ -10998,7 +11290,7 @@ def nikto():
                 "error": "Target parameter is required"
             }), 400
 
-        command = f"nikto -h {target}"
+        command = f"nikto -h {shlex.quote(str(target))}"
 
         if additional_args:
             command += f" {additional_args}"
@@ -11012,6 +11304,33 @@ def nikto():
         return jsonify({
             "error": f"Server error: {str(e)}"
         }), 500
+
+@app.route("/api/tools/whatweb", methods=["POST"])
+def whatweb():
+    """Execute WhatWeb for web technology/framework fingerprinting."""
+    try:
+        params = request.json
+        url = params.get("url", "") or params.get("target", "")
+        aggression = params.get("aggression", "3")
+        additional_args = params.get("additional_args", "")
+        timeout_seconds = int(params.get("timeout", os.environ.get("HEXSTRIKE_WHATWEB_TIMEOUT", "90")))
+
+        if not url:
+            logger.warning("🌐 WhatWeb called without URL parameter")
+            return jsonify({"error": "URL parameter is required"}), 400
+
+        command = f"timeout --kill-after=5s {timeout_seconds}s whatweb -a {shlex.quote(str(aggression))} {shlex.quote(url)}"
+
+        if additional_args:
+            command += f" {additional_args}"
+
+        logger.info(f"🧬 Starting WhatWeb fingerprint: {url}")
+        result = execute_command(command, use_cache=False, timeout=timeout_seconds + 10)
+        logger.info(f"📊 WhatWeb fingerprint completed for {url}")
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"💥 Error in whatweb endpoint: {str(e)}")
+        return jsonify({"error": f"Server error: {str(e)}"}), 500
 
 @app.route("/api/tools/sqlmap", methods=["POST"])
 def sqlmap():
@@ -11028,10 +11347,10 @@ def sqlmap():
                 "error": "URL parameter is required"
             }), 400
 
-        command = f"sqlmap -u {url} --batch"
+        command = f"sqlmap -u {shlex.quote(str(url))} --batch"
 
         if data:
-            command += f" --data=\"{data}\""
+            command += f" --data={shlex.quote(str(data))}"
 
         if additional_args:
             command += f" {additional_args}"
@@ -11042,6 +11361,39 @@ def sqlmap():
         return jsonify(result)
     except Exception as e:
         logger.error(f"💥 Error in sqlmap endpoint: {str(e)}")
+        return jsonify({
+            "error": f"Server error: {str(e)}"
+        }), 500
+
+@app.route("/api/tools/searchsploit", methods=["POST"])
+def searchsploit():
+    """Search Exploit-DB safely without running exploitation modules."""
+    try:
+        params = request.json
+        query = params.get("query", "")
+        additional_args = params.get("additional_args", "")
+        json_output = params.get("json", False)
+
+        if not query:
+            logger.warning("🔎 Searchsploit called without query parameter")
+            return jsonify({
+                "error": "Query parameter is required"
+            }), 400
+
+        command = f"searchsploit --disable-colour {shlex.quote(query)}"
+
+        if json_output:
+            command += " --json"
+
+        if additional_args:
+            command += f" {additional_args}"
+
+        logger.info(f"🔎 Starting Searchsploit lookup: {query}")
+        result = execute_command(command, use_cache=False)
+        logger.info(f"📊 Searchsploit lookup completed: {query}")
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"💥 Error in searchsploit endpoint: {str(e)}")
         return jsonify({
             "error": f"Server error: {str(e)}"
         }), 500
@@ -11061,7 +11413,10 @@ def metasploit():
             }), 400
 
         # Create an MSF resource script
-        resource_content = f"use {module}\n"
+        resource_content = "<ruby>\n"
+        resource_content += "  sleep 0.5 while framework.modules.count < 500\n"
+        resource_content += "</ruby>\n"
+        resource_content += f"use {module}\n"
         for key, value in options.items():
             resource_content += f"set {key} {value}\n"
         resource_content += "exploit\n"
@@ -11113,6 +11468,18 @@ def hydra():
             logger.warning("🔑 Hydra called without username/password parameters")
             return jsonify({
                 "error": "Username/username_file and password/password_file are required"
+            }), 400
+
+        if username and username_file:
+            logger.warning("🔑 Hydra called with both username and username_file (mutually exclusive)")
+            return jsonify({
+                "error": "Both 'username' and 'username_file' were provided — these are mutually exclusive. Use one or the other."
+            }), 400
+
+        if password and password_file:
+            logger.warning("🔑 Hydra called with both password and password_file (mutually exclusive)")
+            return jsonify({
+                "error": "Both 'password' and 'password_file' were provided — these are mutually exclusive. Use one or the other."
             }), 400
 
         command = f"hydra -t 4"
@@ -11195,7 +11562,7 @@ def wpscan():
                 "error": "URL parameter is required"
             }), 400
 
-        command = f"wpscan --url {url}"
+        command = f"wpscan --url {shlex.quote(str(url))}"
 
         if additional_args:
             command += f" {additional_args}"
@@ -11242,7 +11609,7 @@ def ffuf():
     try:
         params = request.json
         url = params.get("url", "")
-        wordlist = params.get("wordlist", "/usr/share/wordlists/dirb/common.txt")
+        wordlist = params.get("wordlist", "/usr/share/dirb/wordlists/common.txt")
         mode = params.get("mode", "directory")
         match_codes = params.get("match_codes", "200,204,301,302,307,401,403")
         additional_args = params.get("additional_args", "")
@@ -11256,13 +11623,13 @@ def ffuf():
         command = f"ffuf"
 
         if mode == "directory":
-            command += f" -u {url}/FUZZ -w {wordlist}"
+            command += f" -u {shlex.quote(str(url).rstrip('/') + '/FUZZ')} -w {shlex.quote(str(wordlist))}"
         elif mode == "vhost":
-            command += f" -u {url} -H 'Host: FUZZ' -w {wordlist}"
+            command += f" -u {shlex.quote(str(url))} -H 'Host: FUZZ' -w {shlex.quote(str(wordlist))}"
         elif mode == "parameter":
-            command += f" -u {url}?FUZZ=value -w {wordlist}"
+            command += f" -u {shlex.quote(str(url) + '?FUZZ=value')} -w {shlex.quote(str(wordlist))}"
         else:
-            command += f" -u {url} -w {wordlist}"
+            command += f" -u {shlex.quote(str(url))} -w {shlex.quote(str(wordlist))}"
 
         command += f" -mc {match_codes}"
 
@@ -11686,22 +12053,19 @@ def enum4linux_ng():
         if domain:
             command += f" -d {domain}"
 
-        # Add specific enumeration options
-        enum_options = []
-        if shares:
-            enum_options.append("S")
-        if users:
-            enum_options.append("U")
-        if groups:
-            enum_options.append("G")
-        if policy:
-            enum_options.append("P")
-
-        if enum_options:
-            command += f" -A {','.join(enum_options)}"
-
+        # If caller provided explicit flags, trust them and skip auto-generated flags
         if additional_args:
             command += f" {additional_args}"
+        else:
+            # Use proper individual flags (NOT -A with comma-joined values)
+            if shares:
+                command += " -S"
+            if users:
+                command += " -U"
+            if groups:
+                command += " -G"
+            if policy:
+                command += " -P"
 
         logger.info(f"🔍 Starting Enum4linux-ng: {target}")
         result = execute_command(command)
@@ -12680,7 +13044,7 @@ def feroxbuster():
     try:
         params = request.json
         url = params.get("url", "")
-        wordlist = params.get("wordlist", "/usr/share/wordlists/dirb/common.txt")
+        wordlist = params.get("wordlist", "/usr/share/dirb/wordlists/common.txt")
         threads = params.get("threads", 10)
         additional_args = params.get("additional_args", "")
 
@@ -12690,7 +13054,7 @@ def feroxbuster():
                 "error": "URL parameter is required"
             }), 400
 
-        command = f"feroxbuster -u {url} -w {wordlist} -t {threads}"
+        command = f"feroxbuster -u {shlex.quote(str(url))} -w {shlex.quote(str(wordlist))} -t {threads}"
 
         if additional_args:
             command += f" {additional_args}"
@@ -12713,6 +13077,7 @@ def dotdotpwn():
         target = params.get("target", "")
         module = params.get("module", "http")
         additional_args = params.get("additional_args", "")
+        timeout_seconds = int(params.get("timeout", os.environ.get("HEXSTRIKE_DOTDOTPWN_TIMEOUT", "90")))
 
         if not target:
             logger.warning("🎯 DotDotPwn called without target parameter")
@@ -12720,7 +13085,7 @@ def dotdotpwn():
                 "error": "Target parameter is required"
             }), 400
 
-        command = f"dotdotpwn -m {module} -h {target}"
+        command = f"timeout --kill-after=5s {timeout_seconds}s dotdotpwn -m {shlex.quote(module)} -h {shlex.quote(target)}"
 
         if additional_args:
             command += f" {additional_args}"
@@ -12728,7 +13093,7 @@ def dotdotpwn():
         command += " -b"
 
         logger.info(f"🔍 Starting DotDotPwn scan: {target}")
-        result = execute_command(command)
+        result = execute_command(command, timeout=timeout_seconds + 10)
         logger.info(f"📊 DotDotPwn scan completed for {target}")
         return jsonify(result)
     except Exception as e:
@@ -12752,10 +13117,10 @@ def xsser():
                 "error": "URL parameter is required"
             }), 400
 
-        command = f"xsser --url '{url}'"
+        command = f"xsser --url {shlex.quote(str(url))}"
 
         if params_str:
-            command += f" --param='{params_str}'"
+            command += f" --param={shlex.quote(str(params_str))}"
 
         if additional_args:
             command += f" {additional_args}"
@@ -12776,7 +13141,7 @@ def wfuzz():
     try:
         params = request.json
         url = params.get("url", "")
-        wordlist = params.get("wordlist", "/usr/share/wordlists/dirb/common.txt")
+        wordlist = params.get("wordlist", "/usr/share/dirb/wordlists/common.txt")
         additional_args = params.get("additional_args", "")
 
         if not url:
@@ -12785,7 +13150,7 @@ def wfuzz():
                 "error": "URL parameter is required"
             }), 400
 
-        command = f"wfuzz -w {wordlist} '{url}'"
+        command = f"wfuzz -w {shlex.quote(str(wordlist))} {shlex.quote(str(url))}"
 
         if additional_args:
             command += f" {additional_args}"
@@ -12813,14 +13178,18 @@ def dirsearch():
         extensions = params.get("extensions", "php,html,js,txt,xml,json")
         wordlist = params.get("wordlist", "/usr/share/wordlists/dirsearch/common.txt")
         threads = params.get("threads", 30)
-        recursive = params.get("recursive", False)
+        recursive_raw = params.get("recursive", False)
+        if isinstance(recursive_raw, bool):
+            recursive = recursive_raw
+        else:
+            recursive = str(recursive_raw).strip().lower() in {"1", "true", "yes", "y", "on"}
         additional_args = params.get("additional_args", "")
 
         if not url:
             logger.warning("🌐 Dirsearch called without URL parameter")
             return jsonify({"error": "URL parameter is required"}), 400
 
-        command = f"dirsearch -u {url} -e {extensions} -w {wordlist} -t {threads}"
+        command = f"dirsearch -u {shlex.quote(str(url))} -e {shlex.quote(str(extensions))} -w {shlex.quote(str(wordlist))} -t {threads}"
 
         if recursive:
             command += " -r"
@@ -12852,7 +13221,7 @@ def katana():
             logger.warning("🌐 Katana called without URL parameter")
             return jsonify({"error": "URL parameter is required"}), 400
 
-        command = f"katana -u {url} -d {depth}"
+        command = f"katana -u {shlex.quote(str(url))} -d {depth}"
 
         if js_crawl:
             command += " -jc"
@@ -12961,10 +13330,10 @@ def arjun():
             logger.warning("🌐 Arjun called without URL parameter")
             return jsonify({"error": "URL parameter is required"}), 400
 
-        command = f"arjun -u {url} -m {method} -t {threads}"
+        command = f"arjun -u {shlex.quote(str(url))} -m {shlex.quote(str(method))} -t {threads}"
 
         if wordlist:
-            command += f" -w {wordlist}"
+            command += f" -w {shlex.quote(str(wordlist))}"
 
         if delay > 0:
             command += f" -d {delay}"
@@ -12998,7 +13367,7 @@ def paramspider():
             logger.warning("🌐 ParamSpider called without domain parameter")
             return jsonify({"error": "Domain parameter is required"}), 400
 
-        command = f"paramspider -d {domain} -l {level}"
+        command = f"paramspider -d {shlex.quote(str(domain))} -l {level}"
 
         if exclude:
             command += f" --exclude {exclude}"
@@ -13033,7 +13402,7 @@ def x8():
             logger.warning("🌐 x8 called without URL parameter")
             return jsonify({"error": "URL parameter is required"}), 400
 
-        command = f"x8 -u {url} -w {wordlist} -X {method}"
+        command = f"x8 -u {shlex.quote(str(url))} -w {shlex.quote(str(wordlist))} -X {shlex.quote(str(method))}"
 
         if body:
             command += f" -b '{body}'"
@@ -13068,7 +13437,7 @@ def jaeles():
             logger.warning("🌐 Jaeles called without URL parameter")
             return jsonify({"error": "URL parameter is required"}), 400
 
-        command = f"jaeles scan -u {url} -c {threads} --timeout {timeout}"
+        command = f"jaeles scan -u {shlex.quote(str(url))} -c {threads} --timeout {timeout}"
 
         if signatures:
             command += f" -s {signatures}"
@@ -13095,8 +13464,13 @@ def dalfox():
         url = params.get("url", "")
         pipe_mode = params.get("pipe_mode", False)
         blind = params.get("blind", False)
-        mining_dom = params.get("mining_dom", True)
-        mining_dict = params.get("mining_dict", True)
+        # Keep targeted parameter checks lightweight by default. Running DOM
+        # and dictionary mining on every crawler-discovered URL can turn one
+        # XSS validation into a multi-minute scan and cause avoidable
+        # scanner-side timeouts. Callers that want heavyweight Dalfox mining
+        # can still opt in explicitly with mining_dom/mining_dict.
+        mining_dom = params.get("mining_dom", False)
+        mining_dict = params.get("mining_dict", False)
         custom_payload = params.get("custom_payload", "")
         additional_args = params.get("additional_args", "")
 
@@ -13107,7 +13481,7 @@ def dalfox():
         if pipe_mode:
             command = "dalfox pipe"
         else:
-            command = f"dalfox url {url}"
+            command = f"dalfox url {shlex.quote(str(url))}"
 
         if blind:
             command += " --blind"
@@ -13151,7 +13525,7 @@ def httpx():
             logger.warning("🌐 httpx called without target parameter")
             return jsonify({"error": "Target parameter is required"}), 400
 
-        command = f"httpx -l {target} -t {threads}"
+        command = f"printf %s\\\\n {shlex.quote(str(target))} | httpx -t {threads}"
 
         if probe:
             command += " -probe"
@@ -14436,6 +14810,7 @@ def dnsenum():
         dns_server = params.get("dns_server", "")
         wordlist = params.get("wordlist", "")
         additional_args = params.get("additional_args", "")
+        timeout_seconds = int(params.get("timeout", os.environ.get("HEXSTRIKE_DNSENUM_TIMEOUT", "90")))
 
         if not domain:
             logger.warning("🌐 DNSenum called without domain parameter")
@@ -14443,19 +14818,25 @@ def dnsenum():
                 "error": "Domain parameter is required"
             }), 400
 
-        command = f"dnsenum {domain}"
+        perl_lib = "/home/ahmed/.local/hexstrike-tools/rootfs/usr/share/perl5:/home/ahmed/.local/hexstrike-tools/rootfs/usr/lib/x86_64-linux-gnu/perl5/5.38"
+        command = f"PERL5LIB={shlex.quote(perl_lib)} timeout --kill-after=5s {timeout_seconds}s dnsenum {shlex.quote(domain)}"
 
         if dns_server:
-            command += f" --dnsserver {dns_server}"
+            command += f" --dnsserver {shlex.quote(dns_server)}"
 
         if wordlist:
-            command += f" --file {wordlist}"
+            command += f" --file {shlex.quote(wordlist)}"
+
+        if "--noreverse" not in additional_args:
+            command += " --noreverse"
+        if "--nocolor" not in additional_args:
+            command += " --nocolor"
 
         if additional_args:
             command += f" {additional_args}"
 
         logger.info(f"🔍 Starting DNSenum: {domain}")
-        result = execute_command(command)
+        result = execute_command(command, timeout=timeout_seconds + 10)
         logger.info(f"📊 DNSenum completed for {domain}")
         return jsonify(result)
     except Exception as e:
@@ -15466,7 +15847,7 @@ def hakrawler():
             }), 400
 
         # Build command for standard Kali Linux hakrawler (hakluke version)
-        command = f"echo '{url}' | hakrawler -d {depth}"
+        command = f"printf %s\\\\n {shlex.quote(str(url))} | hakrawler -d {depth}"
 
         if forms:
             command += " -s"  # Show sources (includes forms)
@@ -17254,6 +17635,11 @@ def get_alternative_tools():
 BANNER = ModernVisualEngine.create_banner()
 
 if __name__ == "__main__":
+
+    # Hard-abort pre-flight check at startup
+    status = build_tools_status()
+    preflight_check(status)
+
     # Display the beautiful new banner
     print(BANNER)
 
